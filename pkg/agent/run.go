@@ -2,7 +2,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -16,8 +15,6 @@ import (
 	systemd "github.com/coreos/go-systemd/v22/daemon"
 	"github.com/k3s-io/k3s/pkg/agent/config"
 	"github.com/k3s-io/k3s/pkg/agent/containerd"
-	"github.com/k3s-io/k3s/pkg/agent/flannel"
-	"github.com/k3s-io/k3s/pkg/agent/netpol"
 	"github.com/k3s-io/k3s/pkg/agent/proxy"
 	"github.com/k3s-io/k3s/pkg/agent/syssetup"
 	"github.com/k3s-io/k3s/pkg/agent/tunnel"
@@ -36,18 +33,16 @@ import (
 	"github.com/k3s-io/k3s/pkg/signals"
 	"github.com/k3s-io/k3s/pkg/spegel"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/errors"
 	"github.com/k3s-io/k3s/pkg/version"
-	pkgerrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/watch"
-	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/kubernetes"
+	toolscache "k8s.io/client-go/tools/cache"
 	toolswatch "k8s.io/client-go/tools/watch"
 	"k8s.io/component-base/cli/globalflag"
 	"k8s.io/component-base/logs"
@@ -60,20 +55,20 @@ import (
 func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 	nodeConfig, err := config.Get(ctx, cfg, proxy)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to retrieve agent configuration")
+		return errors.WithMessage(err, "failed to retrieve agent configuration")
 	}
 
 	dualCluster, err := utilsnet.IsDualStackCIDRs(nodeConfig.AgentConfig.ClusterCIDRs)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to validate cluster-cidr")
+		return errors.WithMessage(err, "failed to validate cluster-cidr")
 	}
 	dualService, err := utilsnet.IsDualStackCIDRs(nodeConfig.AgentConfig.ServiceCIDRs)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to validate service-cidr")
+		return errors.WithMessage(err, "failed to validate service-cidr")
 	}
 	dualNode, err := utilsnet.IsDualStackIPs(nodeConfig.AgentConfig.NodeIPs)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to validate node-ip")
+		return errors.WithMessage(err, "failed to validate node-ip")
 	}
 	serviceIPv4 := utilsnet.IsIPv4CIDR(nodeConfig.AgentConfig.ServiceCIDR)
 	clusterIPv4 := utilsnet.IsIPv4CIDR(nodeConfig.AgentConfig.ClusterCIDR)
@@ -97,14 +92,21 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 
 	// dualStack or IPv6 are not supported on Windows node
 	if (goruntime.GOOS == "windows") && enableIPv6 {
-		return fmt.Errorf("dual-stack or IPv6 are not supported on Windows node")
+		return errors.New("dual-stack or IPv6 are not supported on Windows node")
 	}
 
 	conntrackConfig, err := getConntrackConfig(nodeConfig)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to validate kube-proxy conntrack configuration")
+		return errors.WithMessage(err, "failed to validate kube-proxy conntrack configuration")
 	}
-	syssetup.Configure(enableIPv6, conntrackConfig)
+	// The net/bridge/bridge-nf-call-{ip,ip6}tables sysctls are only required by kube-proxy
+	// and flannel. When both are disabled the node is using an alternative CNI, so leave
+	// these sysctls untouched for the administrator to manage. See
+	// https://github.com/k3s-io/k3s/issues/14022. The flannel backend is compared against the
+	// "none" literal rather than flannel.BackendNone to avoid importing the flannel package,
+	// which registers all flannel backends via init().
+	setBridgeFilter := !config.KubeProxyDisabled(ctx, nodeConfig, proxy) || nodeConfig.Flannel.Backend != "none"
+	syssetup.Configure(enableIPv6, setBridgeFilter, conntrackConfig)
 	nodeConfig.AgentConfig.EnableIPv4 = enableIPv4
 	nodeConfig.AgentConfig.EnableIPv6 = enableIPv6
 
@@ -118,35 +120,24 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 		}
 
 		if err := spegel.DefaultRegistry.Start(ctx, nodeConfig, executor.CRIReadyChan()); err != nil {
-			return pkgerrors.WithMessage(err, "failed to start embedded registry")
+			return errors.WithMessage(err, "failed to start embedded registry")
 		}
 	}
 
 	if nodeConfig.SupervisorMetrics {
 		if err := metrics.DefaultMetrics.Start(ctx, nodeConfig); err != nil {
-			return pkgerrors.WithMessage(err, "failed to serve metrics")
+			return errors.WithMessage(err, "failed to serve metrics")
 		}
 	}
 
 	if nodeConfig.EnablePProf {
 		if err := profile.DefaultProfiler.Start(ctx, nodeConfig); err != nil {
-			return pkgerrors.WithMessage(err, "failed to serve pprof")
+			return errors.WithMessage(err, "failed to serve pprof")
 		}
 	}
 
 	if err := setupCriCtlConfig(cfg, nodeConfig); err != nil {
 		return err
-	}
-
-	if !nodeConfig.NoFlannel {
-		if (nodeConfig.FlannelExternalIP) && (len(nodeConfig.AgentConfig.NodeExternalIPs) == 0) {
-			logrus.Warnf("Server has flannel-external-ip flag set but this node does not set node-external-ip. Flannel will use internal address when connecting to this node.")
-		} else if (nodeConfig.FlannelExternalIP) && (nodeConfig.FlannelBackend != daemonconfig.FlannelBackendWireguardNative) {
-			logrus.Warnf("Flannel is using external addresses with an insecure backend: %v. Please consider using an encrypting flannel backend.", nodeConfig.FlannelBackend)
-		}
-		if err := flannel.Prepare(ctx, nodeConfig); err != nil {
-			return err
-		}
 	}
 
 	// Create a new context to use for agent components that is cancelled on a
@@ -159,7 +150,7 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 
 	go func() {
 		if err := startCRI(ctx, nodeConfig); err != nil {
-			signals.RequestShutdown(pkgerrors.WithMessage(err, "failed to start container runtime"))
+			signals.RequestShutdown(errors.WithMessage(err, "failed to start container runtime"))
 		}
 	}()
 
@@ -170,7 +161,7 @@ func run(ctx context.Context, cfg cmds.Agent, proxy proxy.Proxy) error {
 	go func() {
 		<-executor.APIServerReadyChan()
 		if err := startNetwork(ctx, &sync.WaitGroup{}, nodeConfig); err != nil {
-			signals.RequestShutdown(pkgerrors.WithMessage(err, "failed to start networking"))
+			signals.RequestShutdown(errors.WithMessage(err, "failed to start networking"))
 			return
 		}
 
@@ -195,13 +186,11 @@ func startCRI(ctx context.Context, nodeConfig *daemonconfig.Node) error {
 			return err
 		}
 		return executor.Containerd(ctx, nodeConfig)
-	} else {
-		return executor.CRI(ctx, nodeConfig)
 	}
+	return executor.CRI(ctx, nodeConfig)
 }
 
-// startNetwork updates the network annotations on the node, and starts flannel
-// and the kube-router netpol controller, if enabled.
+// startNetwork updates the network annotations on the node and starts the CNI
 func startNetwork(ctx context.Context, wg *sync.WaitGroup, nodeConfig *daemonconfig.Node) error {
 	// Use the kubelet kubeconfig to update annotations on the local node
 	kubeletClient, err := util.GetClientSet(nodeConfig.AgentConfig.KubeConfigKubelet)
@@ -209,23 +198,11 @@ func startNetwork(ctx context.Context, wg *sync.WaitGroup, nodeConfig *daemoncon
 		return err
 	}
 
-	if err := configureNode(ctx, nodeConfig, kubeletClient.CoreV1().Nodes()); err != nil {
+	if err := configureNode(ctx, nodeConfig, kubeletClient); err != nil {
 		return err
 	}
 
-	if !nodeConfig.NoFlannel {
-		if err := flannel.Run(ctx, wg, nodeConfig); err != nil {
-			return err
-		}
-	}
-
-	if !nodeConfig.AgentConfig.DisableNPC {
-		if err := netpol.Run(ctx, wg, nodeConfig); err != nil {
-			return err
-		}
-	}
-
-	return nil
+	return executor.CNI(ctx, wg, nodeConfig)
 }
 
 // getConntrackConfig uses the kube-proxy code to parse the user-provided kube-proxy-arg values, and
@@ -254,11 +231,11 @@ func getConntrackConfig(nodeConfig *daemonconfig.Node) (*kubeproxyconfig.KubePro
 		return nil, err
 	}
 	ctConfig.MaxPerCore = &maxPerCore
-	min, err := cmd.Flags().GetInt32("conntrack-min")
+	ctMin, err := cmd.Flags().GetInt32("conntrack-min")
 	if err != nil {
 		return nil, err
 	}
-	ctConfig.Min = &min
+	ctConfig.Min = &ctMin
 	establishedTimeout, err := cmd.Flags().GetDuration("conntrack-tcp-timeout-established")
 	if err != nil {
 		return nil, err
@@ -283,7 +260,7 @@ func RunStandalone(ctx context.Context, wg *sync.WaitGroup, cfg cmds.Agent) erro
 
 	nodeConfig, err := config.Get(ctx, cfg, proxy)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "failed to retrieve agent configuration")
+		return errors.WithMessage(err, "failed to retrieve agent configuration")
 	}
 
 	if err := executor.Bootstrap(ctx, nodeConfig, cfg); err != nil {
@@ -304,13 +281,13 @@ func RunStandalone(ctx context.Context, wg *sync.WaitGroup, cfg cmds.Agent) erro
 
 	if nodeConfig.SupervisorMetrics {
 		if err := metrics.DefaultMetrics.Start(ctx, nodeConfig); err != nil {
-			return pkgerrors.WithMessage(err, "failed to serve metrics")
+			return errors.WithMessage(err, "failed to serve metrics")
 		}
 	}
 
 	if nodeConfig.EnablePProf {
 		if err := profile.DefaultProfiler.Start(ctx, nodeConfig); err != nil {
-			return pkgerrors.WithMessage(err, "failed to serve pprof")
+			return errors.WithMessage(err, "failed to serve pprof")
 		}
 	}
 
@@ -353,7 +330,7 @@ func createProxyAndValidateToken(ctx context.Context, cfg *cmds.Agent) (proxy.Pr
 
 	_, nodeIPs, err := util.GetHostnameAndIPs(cfg.NodeName, cfg.NodeIP.Value())
 	if err != nil {
-		return nil, pkgerrors.WithMessage(err, "failed to get node name and addresses")
+		return nil, errors.WithMessage(err, "failed to get node name and addresses")
 	}
 
 	proxy, err := proxy.NewSupervisorProxy(ctx, !cfg.DisableLoadBalancer, agentDir, cfg.ServerURL, cfg.LBServerPort, utilsnet.IsIPv6(nodeIPs[0]))
@@ -385,77 +362,44 @@ func createProxyAndValidateToken(ctx context.Context, cfg *cmds.Agent) (proxy.Pr
 
 // configureNode waits for the node object to be created, and if/when it does,
 // ensures that the labels and annotations are up to date.
-func configureNode(ctx context.Context, nodeConfig *daemonconfig.Node, nodes typedcorev1.NodeInterface) error {
-	agentConfig := &nodeConfig.AgentConfig
-	fieldSelector := fields.Set{metav1.ObjectNameField: agentConfig.NodeName}.String()
-	lw := &cache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (object runtime.Object, e error) {
-			options.FieldSelector = fieldSelector
-			return nodes.List(ctx, options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (i watch.Interface, e error) {
-			options.FieldSelector = fieldSelector
-			return nodes.Watch(ctx, options)
-		},
-	}
-
+func configureNode(ctx context.Context, nodeConfig *daemonconfig.Node, coreClient kubernetes.Interface) error {
+	patcher := util.NewPatcher[*v1.Node](coreClient.CoreV1().Nodes())
+	lw := toolscache.NewListWatchFromClient(coreClient.CoreV1().RESTClient(), "nodes", metav1.NamespaceNone, fields.OneTermEqualSelector(metav1.ObjectNameField, nodeConfig.AgentConfig.NodeName))
 	condition := func(ev watch.Event) (bool, error) {
 		node, ok := ev.Object.(*v1.Node)
 		if !ok {
 			return false, errors.New("event object not of type v1.Node")
 		}
 
-		updateNode := false
-		if labels, changed := updateMutableLabels(agentConfig, node.Labels); changed {
-			node.Labels = labels
-			updateNode = true
-		}
+		patch := util.NewPatchList()
+		updateMutableLabels(&nodeConfig.AgentConfig, patch)
 
-		if !agentConfig.DisableCCM {
-			if annotations, changed := updateAddressAnnotations(nodeConfig, node.Annotations); changed {
-				node.Annotations = annotations
-				updateNode = true
-			}
-			if labels, changed := updateLegacyAddressLabels(agentConfig, node.Labels); changed {
-				node.Labels = labels
-				updateNode = true
-			}
+		if nodeConfig.AgentConfig.DisableCCM {
+			removeAddressAnnotations(patch, node)
+			removeLegacyAddressLabels(patch, node)
+		} else {
+			updateAddressAnnotations(&nodeConfig.AgentConfig, patch, node)
+			updateLegacyAddressLabels(&nodeConfig.AgentConfig, patch, node)
 		}
 
 		// inject node config
-		if changed, err := nodeconfig.SetNodeConfigAnnotations(nodeConfig, node); err != nil {
-			return false, err
-		} else if changed {
-			updateNode = true
-		}
+		nodeconfig.SetNodeConfigAnnotations(nodeConfig, patch, node)
+		nodeconfig.SetNodeConfigLabels(nodeConfig, patch, node)
 
-		if changed, err := nodeconfig.SetNodeConfigLabels(nodeConfig, node); err != nil {
-			return false, err
-		} else if changed {
-			updateNode = true
+		if _, err := patcher.Patch(ctx, patch, nodeConfig.AgentConfig.NodeName); err != nil {
+			logrus.Infof("Failed to set annotations and labels on node %s: %v", nodeConfig.AgentConfig.NodeName, err)
+			return false, nil
 		}
-
-		if updateNode {
-			if _, err := nodes.Update(ctx, node, metav1.UpdateOptions{}); err != nil {
-				logrus.Infof("Failed to set annotations and labels on node %s: %v", agentConfig.NodeName, err)
-				return false, nil
-			}
-			logrus.Infof("Annotations and labels have been set successfully on node: %s", agentConfig.NodeName)
-			return true, nil
-		}
-		logrus.Infof("Annotations and labels have already set on node: %s", agentConfig.NodeName)
+		logrus.Infof("Annotations and labels have been set successfully on node: %s", nodeConfig.AgentConfig.NodeName)
 		return true, nil
 	}
-
 	if _, err := toolswatch.UntilWithSync(ctx, lw, &v1.Node{}, nil, condition); err != nil {
-		return pkgerrors.WithMessage(err, "failed to configure node")
+		return errors.WithMessage(err, "failed to configure node")
 	}
 	return nil
 }
 
-func updateMutableLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]string) (map[string]string, bool) {
-	result := map[string]string{}
-
+func updateMutableLabels(agentConfig *daemonconfig.Agent, patch *util.PatchList) {
 	for _, m := range agentConfig.NodeLabels {
 		var (
 			v string
@@ -465,65 +409,58 @@ func updateMutableLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]
 		if len(p) > 1 {
 			v = p[1]
 		}
-		result[k] = v
+		patch.Add(v, "metadata", "labels", k)
 	}
-	result = labels.Merge(nodeLabels, result)
-	return result, !equality.Semantic.DeepEqual(nodeLabels, result)
 }
 
-func updateLegacyAddressLabels(agentConfig *daemonconfig.Agent, nodeLabels map[string]string) (map[string]string, bool) {
-	ls := labels.Set(nodeLabels)
+func updateLegacyAddressLabels(agentConfig *daemonconfig.Agent, patch *util.PatchList, node *v1.Node) {
+	ls := labels.Set(node.Labels)
 	if ls.Has(cp.InternalIPKey) || ls.Has(cp.HostnameKey) {
-		result := map[string]string{
-			cp.InternalIPKey: agentConfig.NodeIP,
-			cp.HostnameKey:   getHostname(agentConfig),
-		}
+		patch.Add(agentConfig.NodeIP, "metadata", "labels", cp.InternalIPKey)
+		patch.Add(getHostname(agentConfig), "metadata", "labels", cp.HostnameKey)
 
 		if agentConfig.NodeExternalIP != "" {
-			result[cp.ExternalIPKey] = agentConfig.NodeExternalIP
+			patch.Add(agentConfig.NodeExternalIP, "metadata", "labels", cp.ExternalIPKey)
 		}
-
-		result = labels.Merge(nodeLabels, result)
-		return result, !equality.Semantic.DeepEqual(nodeLabels, result)
 	}
-	return nil, false
+}
+
+func removeLegacyAddressLabels(patch *util.PatchList, node *v1.Node) {
+	for _, key := range []string{cp.HostnameKey, cp.InternalIPKey, cp.ExternalIPKey} {
+		if _, ok := node.Labels[key]; ok {
+			patch.Remove("metadata", "labels", key)
+		}
+	}
 }
 
 // updateAddressAnnotations updates the node annotations with important information about IP addresses of the node
-func updateAddressAnnotations(nodeConfig *daemonconfig.Node, nodeAnnotations map[string]string) (map[string]string, bool) {
-	agentConfig := &nodeConfig.AgentConfig
-	result := map[string]string{
-		cp.InternalIPKey: util.JoinIPs(agentConfig.NodeIPs),
-		cp.HostnameKey:   getHostname(agentConfig),
-	}
+func updateAddressAnnotations(agentConfig *daemonconfig.Agent, patch *util.PatchList, node *v1.Node) {
+	patch.Add(util.JoinIPs(agentConfig.NodeIPs), "metadata", "annotations", cp.InternalIPKey)
+	patch.Add(getHostname(agentConfig), "metadata", "annotations", cp.HostnameKey)
 
 	if agentConfig.NodeExternalIP != "" {
-		result[cp.ExternalIPKey] = util.JoinIPs(agentConfig.NodeExternalIPs)
-		if nodeConfig.FlannelExternalIP {
-			for _, ipAddress := range agentConfig.NodeExternalIPs {
-				if utilsnet.IsIPv4(ipAddress) {
-					result[flannel.FlannelExternalIPv4Annotation] = ipAddress.String()
-				}
-				if utilsnet.IsIPv6(ipAddress) {
-					result[flannel.FlannelExternalIPv6Annotation] = ipAddress.String()
-				}
-			}
-		}
+		patch.Add(util.JoinIPs(agentConfig.NodeExternalIPs), "metadata", "annotations", cp.ExternalIPKey)
 	}
 
 	if len(agentConfig.NodeInternalDNSs) > 0 {
-		result[cp.InternalDNSKey] = strings.Join(agentConfig.NodeInternalDNSs, ",")
-	} else {
-		delete(result, cp.InternalDNSKey)
-	}
-	if len(agentConfig.NodeExternalDNSs) > 0 {
-		result[cp.ExternalDNSKey] = strings.Join(agentConfig.NodeExternalDNSs, ",")
-	} else {
-		delete(result, cp.ExternalDNSKey)
+		patch.Add(strings.Join(agentConfig.NodeInternalDNSs, ","), "metadata", "annotations", cp.InternalDNSKey)
+	} else if _, ok := node.Annotations[cp.InternalDNSKey]; ok {
+		patch.Remove("metadata", "annotations", cp.InternalDNSKey)
 	}
 
-	result = labels.Merge(nodeAnnotations, result)
-	return result, !equality.Semantic.DeepEqual(nodeAnnotations, result)
+	if len(agentConfig.NodeExternalDNSs) > 0 {
+		patch.Add(strings.Join(agentConfig.NodeExternalDNSs, ","), "metadata", "annotations", cp.ExternalDNSKey)
+	} else if _, ok := node.Annotations[cp.ExternalDNSKey]; ok {
+		patch.Remove("metadata", "annotations", cp.ExternalDNSKey)
+	}
+}
+
+func removeAddressAnnotations(patch *util.PatchList, node *v1.Node) {
+	for _, key := range []string{cp.HostnameKey, cp.InternalIPKey, cp.ExternalIPKey, cp.InternalDNSKey, cp.ExternalDNSKey} {
+		if _, ok := node.Annotations[key]; ok {
+			patch.Remove("metadata", "annotations", key)
+		}
+	}
 }
 
 // setupTunnelAndRunAgent starts the agent tunnel, cert expiry monitoring, and

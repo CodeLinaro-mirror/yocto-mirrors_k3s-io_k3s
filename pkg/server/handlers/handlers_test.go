@@ -18,12 +18,18 @@ import (
 	"path/filepath"
 	"testing"
 
+	//revive:disable:dot-imports
+	. "github.com/onsi/gomega"
+
 	"github.com/k3s-io/k3s/pkg/authenticator"
 	"github.com/k3s-io/k3s/pkg/cli/cmds"
 	"github.com/k3s-io/k3s/pkg/daemons/config"
+	"github.com/k3s-io/k3s/pkg/nodepassword"
+	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/logger"
+	"github.com/k3s-io/k3s/pkg/version"
 	testutil "github.com/k3s-io/k3s/tests"
 	"github.com/k3s-io/k3s/tests/mock"
-	. "github.com/onsi/gomega"
 	"github.com/onsi/gomega/types"
 	certutil "github.com/rancher/dynamiclistener/cert"
 	"github.com/sirupsen/logrus"
@@ -31,10 +37,14 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
 func init() {
-	logrus.SetLevel(logrus.DebugLevel)
+	logrus.SetLevel(logrus.TraceLevel)
+	logrus.SetFormatter(&logrus.TextFormatter{DisableQuote: true})
+	klog.SetLoggerWithOptions(logger.NewLogrusSink(nil).AsLogr(), klog.ContextualLogger(true))
 }
 
 func Test_UnitHandlers(t *testing.T) {
@@ -97,11 +107,11 @@ func Test_UnitHandlers(t *testing.T) {
 		paths       []pathTest
 	}{
 		{
-			//*** tests with runtime core not ready ***
+			// *** tests with runtime core not ready ***
 			name:        "no runtime core",
 			controlFunc: getCorelessControl,
 			paths: []pathTest{
-				//** paths accessible with node cert or agent token, and specific headers **
+				// ** paths accessible with node cert or agent token, and specific headers **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/serving-kubelet.crt",
@@ -348,7 +358,7 @@ func Test_UnitHandlers(t *testing.T) {
 			},
 		},
 		{
-			//*** tests with runtime core not ready and bind address set ***
+			// *** tests with runtime core not ready and bind address set ***
 			name: "no runtime core with bind-address",
 			controlFunc: func(t *testing.T) (*config.Control, context.CancelFunc) {
 				control, cancel := getCorelessControl(t)
@@ -356,7 +366,7 @@ func Test_UnitHandlers(t *testing.T) {
 				return control, cancel
 			},
 			paths: []pathTest{
-				//** paths accessible with node cert or agent token, and specific headers **
+				// ** paths accessible with node cert or agent token, and specific headers **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/serving-kubelet.crt",
@@ -603,11 +613,11 @@ func Test_UnitHandlers(t *testing.T) {
 			},
 		},
 		{
-			//*** tests with no agent and runtime core not ready ***
+			// *** tests with no agent and runtime core not ready ***
 			name:        "agentless no runtime core",
 			controlFunc: getCorelessAgentlessControl,
 			paths: []pathTest{
-				//** paths accessible with node cert or agent token, and specific headers **
+				// ** paths accessible with node cert or agent token, and specific headers **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/serving-kubelet.crt",
@@ -866,11 +876,11 @@ func Test_UnitHandlers(t *testing.T) {
 			},
 		},
 		{
-			//*** tests with mocked core controllers ***
+			// *** tests with mocked core controllers ***
 			name:        "mocked",
 			controlFunc: getMockedControl,
 			paths: []pathTest{
-				//** paths accessible with node cert or agent token, and specific headers **
+				// ** paths accessible with node cert or agent token, and specific headers **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/serving-kubelet.crt",
@@ -1125,7 +1135,7 @@ func Test_UnitHandlers(t *testing.T) {
 						},
 					),
 				},
-				//** paths accessible with node cert or agent token **
+				// ** paths accessible with node cert or agent token **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/client-kube-proxy.crt",
@@ -1432,7 +1442,7 @@ func Test_UnitHandlers(t *testing.T) {
 						},
 					),
 				},
-				//** paths accessible with node cert **
+				// ** paths accessible with node cert **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/connect",
@@ -1452,7 +1462,7 @@ func Test_UnitHandlers(t *testing.T) {
 						},
 					),
 				},
-				//** paths accessible with server token **
+				// ** paths accessible with server token **
 				{
 					method: http.MethodGet,
 					path:   "/v1-k3s/encrypt/status",
@@ -1527,7 +1537,7 @@ func Test_UnitHandlers(t *testing.T) {
 						},
 					),
 				},
-				//** paths accessible with apiserver cert **
+				// ** paths accessible with apiserver cert **
 				{
 					method: http.MethodConnect,
 					path:   "/",
@@ -1543,7 +1553,7 @@ func Test_UnitHandlers(t *testing.T) {
 						},
 					),
 				},
-				//** paths accessible anonymously **
+				// ** paths accessible anonymously **
 				{
 					method: http.MethodGet,
 					path:   "/ping",
@@ -1610,6 +1620,7 @@ func Test_UnitHandlers(t *testing.T) {
 // getCorelessControl returns a Control structure with no mocked core controllers,
 // as if the apiserver were not yet available.
 func getCorelessControl(t *testing.T) (*config.Control, context.CancelFunc) {
+	g := NewWithT(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	control := &config.Control{
 		Token:          "token",
@@ -1639,7 +1650,7 @@ func getCorelessControl(t *testing.T) (*config.Control, context.CancelFunc) {
 		"--basic-auth-file=" + control.Runtime.PasswdFile,
 		"--client-ca-file=" + control.Runtime.ClientCA,
 	})
-	NewWithT(t).Expect(err).ToNot(HaveOccurred())
+	g.Expect(err).ToNot(HaveOccurred())
 	control.Runtime.Authenticator = auth
 
 	// finally, bind request handlers
@@ -1651,6 +1662,7 @@ func getCorelessControl(t *testing.T) (*config.Control, context.CancelFunc) {
 // getCorelessAgentlessControl returns a Control structure with no mocked core controllers,
 // as if the apiserver were not yet available on a node with no local agent.
 func getCorelessAgentlessControl(t *testing.T) (*config.Control, context.CancelFunc) {
+	g := NewWithT(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	control := &config.Control{
 		Token:          "token",
@@ -1674,7 +1686,7 @@ func getCorelessAgentlessControl(t *testing.T) (*config.Control, context.CancelF
 		"--basic-auth-file=" + control.Runtime.PasswdFile,
 		"--client-ca-file=" + control.Runtime.ClientCA,
 	})
-	NewWithT(t).Expect(err).ToNot(HaveOccurred())
+	g.Expect(err).ToNot(HaveOccurred())
 	control.Runtime.Authenticator = auth
 
 	// finally, bind request handlers
@@ -1686,6 +1698,7 @@ func getCorelessAgentlessControl(t *testing.T) (*config.Control, context.CancelF
 // getMockedControl returns a Control structure with mocked core controllers in place
 // of a full functional datastore and apiserver.
 func getMockedControl(t *testing.T) (*config.Control, context.CancelFunc) {
+	g := NewWithT(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	control := &config.Control{
 		Token:          "token",
@@ -1701,6 +1714,18 @@ func getMockedControl(t *testing.T) (*config.Control, context.CancelFunc) {
 	// setting up a whole remotedialer tunnel server here
 	control.Runtime.Tunnel = http.HandlerFunc(func(resp http.ResponseWriter, req *http.Request) {})
 
+	// While creating a RESTConfig and client will succeed as long as the kubeconfig is valid,
+	// the client created here will not be usable as the apiserver is not started for testing.
+	// We create a real client instead of using k8s.io/client-go/kubernetes/fake because fake's
+	// RESTClient() calls all return nil, which causes ListWatch users to panic. With a real
+	// client, the calls just fail which is fine for what we're doing here.
+	restConfig, err := util.GetRESTConfig(control.Runtime.KubeConfigSupervisor)
+	g.Expect(err).ToNot(HaveOccurred())
+	restConfig.UserAgent = util.GetUserAgent(version.Program + "-supervisor")
+
+	k8s, err := kubernetes.NewForConfig(restConfig)
+	g.Expect(err).ToNot(HaveOccurred())
+
 	// wire up mock controllers and cache stores
 	secretStore := &mock.SecretStore{}
 	nodeStore := &mock.NodeStore{}
@@ -1708,20 +1733,32 @@ func getMockedControl(t *testing.T) (*config.Control, context.CancelFunc) {
 	nodeStore.Create(&v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "k3s-agent-1"}})
 
 	ctrl := gomock.NewController(t)
+	informer := mock.NewSharedIndexInformer(ctrl)
+	informer.EXPECT().HasSynced().AnyTimes().Return(false)
 	coreFactory := mock.NewCoreFactory(ctrl)
-	coreFactory.CoreMock.V1Mock.SecretMock.EXPECT().Cache().AnyTimes().Return(coreFactory.CoreMock.V1Mock.SecretCache)
 	coreFactory.CoreMock.V1Mock.SecretMock.EXPECT().Create(gomock.Any()).AnyTimes().DoAndReturn(secretStore.Create)
-	coreFactory.CoreMock.V1Mock.SecretCache.EXPECT().Get(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(secretStore.Get)
+	coreFactory.CoreMock.V1Mock.SecretMock.EXPECT().List(gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(secretStore.ListWithOptions)
+	coreFactory.CoreMock.V1Mock.SecretMock.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().DoAndReturn(secretStore.GetWithOptions)
+	coreFactory.CoreMock.V1Mock.NodeMock.EXPECT().OnChange(gomock.Any(), gomock.Any(), gomock.Any()).Times(1)
 	coreFactory.CoreMock.V1Mock.NodeMock.EXPECT().Cache().AnyTimes().Return(coreFactory.CoreMock.V1Mock.NodeCache)
+	coreFactory.CoreMock.V1Mock.NodeMock.EXPECT().Informer().AnyTimes().Return(informer)
 	coreFactory.CoreMock.V1Mock.NodeCache.EXPECT().Get(gomock.Any()).AnyTimes().DoAndReturn(nodeStore.Get)
 	control.Runtime.Core = coreFactory
+	control.Runtime.K8s = k8s
+
+	// create event recorder
+	control.Runtime.Event = util.BuildControllerEventRecorder(ctx, control.Runtime.K8s, version.Program+"-supervisor", metav1.NamespaceAll)
+
+	// start the node password controller
+	err = nodepassword.Register(ctx, control.Runtime.K8s, coreFactory.Core().V1().Secret(), coreFactory.Core().V1().Node())
+	g.Expect(err).ToNot(HaveOccurred())
 
 	// add authenticator
 	auth, err := authenticator.FromArgs([]string{
 		"--basic-auth-file=" + control.Runtime.PasswdFile,
 		"--client-ca-file=" + control.Runtime.ClientCA,
 	})
-	NewWithT(t).Expect(err).ToNot(HaveOccurred())
+	g.Expect(err).ToNot(HaveOccurred())
 	control.Runtime.Authenticator = auth
 
 	// finally, bind request handlers

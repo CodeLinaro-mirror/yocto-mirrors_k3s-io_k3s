@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/k3s-io/k3s/pkg/flock"
+	"github.com/k3s-io/k3s/pkg/util/errors"
 	"github.com/k3s-io/k3s/tests"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -239,16 +239,16 @@ func K3sKillServer(server *K3sServer) error {
 			logrus.Warnf("Unable to kill k3s server: %v", err)
 			return nil
 		}
-		return errors.Wrap(err, "failed to find k3s process group")
+		return errors.WithMessage(err, "failed to find k3s process group")
 	}
 	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil {
-		return errors.Wrap(err, "failed to kill k3s process group")
+		return errors.WithMessage(err, "failed to kill k3s process group")
 	}
 	if err := server.cmd.Process.Kill(); err != nil {
-		return errors.Wrap(err, "failed to kill k3s process")
+		return errors.WithMessage(err, "failed to kill k3s process")
 	}
 	if _, err = server.cmd.Process.Wait(); err != nil {
-		return errors.Wrap(err, "failed to wait for k3s process exit")
+		return errors.WithMessage(err, "failed to wait for k3s process exit")
 	}
 	//Unmount all the associated filesystems
 	unmountFolder("/run/k3s")
@@ -311,6 +311,30 @@ func K3sSaveLog(server *K3sServer, dump bool) error {
 	}
 	fmt.Printf("Server Log Dump:\n\n%s\n\n", b)
 	return nil
+}
+
+func K3sCopyPodLogs(server *K3sServer) error {
+	f, err := os.Create("var-log-pods-log.txt")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	results, _ := RunCommand("find /var/log/pods -type f | xargs tail -n 10000")
+	_, err = fmt.Fprint(f, results)
+	return err
+}
+
+func K3sDumpResources(server *K3sServer, resources ...string) error {
+	f, err := os.Create("resources-dump-log.txt")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	results, _ := K3sCmd("kubectl", "get", "-A", "-o", "yaml", strings.Join(resources, ","))
+	_, err = fmt.Fprint(f, results)
+	return err
 }
 
 func GetEndpointsAddresses() (string, error) {

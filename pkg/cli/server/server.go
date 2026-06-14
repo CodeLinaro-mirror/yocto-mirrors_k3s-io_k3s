@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -12,7 +11,6 @@ import (
 	"time"
 
 	systemd "github.com/coreos/go-systemd/v22/daemon"
-	"github.com/gorilla/mux"
 	"github.com/k3s-io/k3s/pkg/agent"
 	"github.com/k3s-io/k3s/pkg/agent/https"
 	"github.com/k3s-io/k3s/pkg/agent/loadbalancer"
@@ -30,15 +28,19 @@ import (
 	"github.com/k3s-io/k3s/pkg/signals"
 	"github.com/k3s-io/k3s/pkg/spegel"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/errors"
+	"github.com/k3s-io/k3s/pkg/util/logger"
+	"github.com/k3s-io/k3s/pkg/util/mux"
 	"github.com/k3s-io/k3s/pkg/util/permissions"
 	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/k3s-io/k3s/pkg/vpn"
-	pkgerrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/apimachinery/pkg/util/wait"
 	kubeapiserverflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/controlplane/apiserver/options"
 	utilsnet "k8s.io/utils/net"
 )
@@ -53,8 +55,6 @@ func RunWithControllers(app *cli.Context, leaderControllers server.CustomControl
 
 func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomControllers, controllers server.CustomControllers) (rerr error) {
 	var err error
-	// Validate build env
-	cmds.MustValidateGolang()
 
 	// hide process arguments from ps output, since they may contain
 	// database credentials or other secrets.
@@ -75,12 +75,16 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		return err
 	}
 
-	ctx := signals.SetupSignalContext()
+	klog.EnableContextualLogging(true)
+	ctx := logger.NewContext(signals.SetupSignalContext(), version.Program)
 	wg := &sync.WaitGroup{}
 
 	// If exiting due to an error, ensure that contexts are cancelled so that the
 	// WaitGroup exits.  Otherwise, wait for something else to initiate shutdown.
 	defer func() {
+		if r := recover(); r != nil {
+			rerr = fmt.Errorf("server panicked: %v", r)
+		}
 		if rerr != nil {
 			// do not need to pass the error in here, it will be reported by the CLI error handler
 			signals.RequestShutdown(nil)
@@ -93,7 +97,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 
 	if !cfg.DisableAgent && !cfg.Rootless {
 		if err := permissions.IsPrivileged(); err != nil {
-			return pkgerrors.WithMessage(err, "server requires additional privilege when not run with --rootless and/or --disable-agent")
+			return errors.WithMessage(err, "server requires additional privilege when not run with --rootless and/or --disable-agent")
 		}
 	}
 
@@ -114,21 +118,6 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		}
 	}
 
-	if cmds.AgentConfig.VPNAuthFile != "" {
-		cmds.AgentConfig.VPNAuth, err = util.ReadFile(cmds.AgentConfig.VPNAuthFile)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Starts the VPN in the server if config was set up
-	if cmds.AgentConfig.VPNAuth != "" {
-		err := vpn.StartVPN(cmds.AgentConfig.VPNAuth)
-		if err != nil {
-			return err
-		}
-	}
-
 	serverConfig := server.Config{}
 	serverConfig.DisableAgent = cfg.DisableAgent
 	serverConfig.ControlConfig.Runtime = config.NewRuntime()
@@ -136,13 +125,13 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.AgentToken = cfg.AgentToken
 	serverConfig.ControlConfig.JoinURL = cfg.ServerURL
 	if cfg.AgentTokenFile != "" {
-		serverConfig.ControlConfig.AgentToken, err = util.ReadFile(cfg.AgentTokenFile)
+		serverConfig.ControlConfig.AgentToken, err = util.ReadFile(ctx, cfg.AgentTokenFile)
 		if err != nil {
 			return err
 		}
 	}
 	if cfg.TokenFile != "" {
-		serverConfig.ControlConfig.Token, err = util.ReadFile(cfg.TokenFile)
+		serverConfig.ControlConfig.Token, err = util.ReadFile(ctx, cfg.TokenFile)
 		if err != nil {
 			return err
 		}
@@ -152,6 +141,14 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.Datastore.BackendTLSConfig.CertFile = cfg.DatastoreCertFile
 	serverConfig.ControlConfig.Datastore.BackendTLSConfig.KeyFile = cfg.DatastoreKeyFile
 	serverConfig.ControlConfig.Datastore.Endpoint = cfg.DatastoreEndpoint
+	serverConfig.ControlConfig.Datastore.S3Config.AccessKey = cfg.EtcdS3AccessKey
+	serverConfig.ControlConfig.Datastore.S3Config.Bucket = cfg.EtcdS3BucketName
+	serverConfig.ControlConfig.Datastore.S3Config.CABundle = cfg.EtcdS3EndpointCA
+	serverConfig.ControlConfig.Datastore.S3Config.Endpoint = cfg.EtcdS3Endpoint
+	serverConfig.ControlConfig.Datastore.S3Config.Folder = cfg.EtcdS3Folder
+	serverConfig.ControlConfig.Datastore.S3Config.Region = cfg.EtcdS3Region
+	serverConfig.ControlConfig.Datastore.S3Config.SecretKey = cfg.EtcdS3SecretKey
+	serverConfig.ControlConfig.Datastore.S3Config.SessionToken = cfg.EtcdS3SessionToken
 	serverConfig.ControlConfig.Datastore.WaitGroup = wg
 	serverConfig.ControlConfig.DataDir = cfg.DataDir
 	serverConfig.ControlConfig.KubeConfigOutput = cfg.KubeConfigOutput
@@ -212,6 +209,11 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		if cfg.EtcdS3 {
 			if cfg.EtcdS3Timeout <= 0 {
 				return errors.New("etcd-s3-timeout must be greater than 0s")
+			}
+			// set default s3 retention from local snapshot retention
+			// preserves legacy behavior of local snapshot retention also affecting s3
+			if !app.IsSet("etcd-s3-retention") && app.IsSet("etcd-snapshot-retention") {
+				cfg.EtcdS3Retention = cfg.EtcdSnapshotRetention
 			}
 			serverConfig.ControlConfig.EtcdS3 = &config.EtcdS3{
 				AccessKey:     cfg.EtcdS3AccessKey,
@@ -290,59 +292,12 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	}
 	serverConfig.ControlConfig.ServerNodeName = nodeName
 	serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, "127.0.0.1", "::1", "localhost", nodeName)
+	serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, util.SplitStringSlice(cmds.AgentConfig.NodeExternalIP.Value())...)
+	if shortName := strings.SplitN(nodeName, ".", 2)[0]; shortName != nodeName {
+		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, shortName)
+	}
 	for _, ip := range nodeIPs {
 		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, ip.String())
-	}
-
-	// if not set, try setting advertise-ip from agent VPN
-	if cmds.AgentConfig.VPNAuth != "" {
-		vpnInfo, err := vpn.GetVPNInfo(cmds.AgentConfig.VPNAuth)
-		if err != nil {
-			return err
-		}
-
-		// If we are in ipv6-only mode, we should pass the ipv6 address. Otherwise, ipv4
-		if utilsnet.IsIPv6(nodeIPs[0]) {
-			if vpnInfo.IPv6Address != nil {
-				logrus.Infof("Changed advertise-address to %v due to VPN", vpnInfo.IPv6Address)
-				if serverConfig.ControlConfig.AdvertiseIP != "" {
-					logrus.Warn("Conflict in the config detected. VPN integration overwrites advertise-address but the config is setting the advertise-address parameter")
-				}
-				serverConfig.ControlConfig.AdvertiseIP = vpnInfo.IPv6Address.String()
-			} else {
-				return errors.New("tailscale does not provide an ipv6 address")
-			}
-		} else {
-			// We are in dual-stack or ipv4-only mode
-			if vpnInfo.IPv4Address != nil {
-				logrus.Infof("Changed advertise-address to %v due to VPN", vpnInfo.IPv4Address)
-				if serverConfig.ControlConfig.AdvertiseIP != "" {
-					logrus.Warn("Conflict in the config detected. VPN integration overwrites advertise-address but the config is setting the advertise-address parameter")
-				}
-				serverConfig.ControlConfig.AdvertiseIP = vpnInfo.IPv4Address.String()
-			} else {
-				return errors.New("tailscale does not provide an ipv4 address")
-			}
-		}
-		logrus.Warn("Etcd IP (PrivateIP) remains the local IP. Running etcd traffic over VPN is not recommended due to performance issues")
-	} else {
-
-		// if not set, try setting advertise-ip from agent node-external-ip
-		if serverConfig.ControlConfig.AdvertiseIP == "" && len(cmds.AgentConfig.NodeExternalIP.Value()) != 0 {
-			serverConfig.ControlConfig.AdvertiseIP = util.GetFirstValidIPString(cmds.AgentConfig.NodeExternalIP.Value())
-		}
-
-		// if not set, try setting advertise-ip from agent node-ip
-		if serverConfig.ControlConfig.AdvertiseIP == "" && len(cmds.AgentConfig.NodeIP.Value()) != 0 {
-			serverConfig.ControlConfig.AdvertiseIP = util.GetFirstValidIPString(cmds.AgentConfig.NodeIP.Value())
-		}
-	}
-
-	// if we ended up with any advertise-ips, ensure they're added to the SAN list;
-	// note that kube-apiserver does not support dual-stack advertise-ip as of 1.21.0:
-	/// https://github.com/kubernetes/kubeadm/issues/1612#issuecomment-772583989
-	if serverConfig.ControlConfig.AdvertiseIP != "" {
-		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, serverConfig.ControlConfig.AdvertiseIP)
 	}
 
 	// configure ClusterIPRanges. Use default 10.42.0.0/16 or fd00:42::/56 if user did not set it
@@ -353,7 +308,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	for _, cidr := range util.SplitStringSlice(cmds.ServerConfig.ClusterCIDR.Value()) {
 		_, parsed, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return pkgerrors.WithMessagef(err, "invalid cluster-cidr %s", cidr)
+			return errors.WithMessagef(err, "invalid cluster-cidr %s", cidr)
 		}
 		serverConfig.ControlConfig.ClusterIPRanges = append(serverConfig.ControlConfig.ClusterIPRanges, parsed)
 	}
@@ -368,7 +323,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	for _, cidr := range util.SplitStringSlice(cmds.ServerConfig.ServiceCIDR.Value()) {
 		_, parsed, err := net.ParseCIDR(cidr)
 		if err != nil {
-			return pkgerrors.WithMessagef(err, "invalid service-cidr %s", cidr)
+			return errors.WithMessagef(err, "invalid service-cidr %s", cidr)
 		}
 		serverConfig.ControlConfig.ServiceIPRanges = append(serverConfig.ControlConfig.ServiceIPRanges, parsed)
 	}
@@ -378,7 +333,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 
 	serverConfig.ControlConfig.ServiceNodePortRange, err = utilnet.ParsePortRange(cfg.ServiceNodePortRange)
 	if err != nil {
-		return pkgerrors.WithMessagef(err, "invalid port range %s", cfg.ServiceNodePortRange)
+		return errors.WithMessagef(err, "invalid port range %s", cfg.ServiceNodePortRange)
 	}
 
 	// the apiserver service does not yet support dual-stack operation
@@ -396,7 +351,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		for _, svcCIDR := range serverConfig.ControlConfig.ServiceIPRanges {
 			clusterDNS, err := utilsnet.GetIndexedIP(svcCIDR, 10)
 			if err != nil {
-				return pkgerrors.WithMessage(err, "cannot configure default cluster-dns address")
+				return errors.WithMessage(err, "cannot configure default cluster-dns address")
 			}
 			serverConfig.ControlConfig.ClusterDNSs = append(serverConfig.ControlConfig.ClusterDNSs, clusterDNS)
 		}
@@ -446,7 +401,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.MinTLSVersion = tlsMinVersionArg
 	serverConfig.ControlConfig.TLSMinVersion, err = kubeapiserverflag.TLSVersion(tlsMinVersionArg)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "invalid tls-min-version")
+		return errors.WithMessage(err, "invalid tls-min-version")
 	}
 
 	serverConfig.StartupHooks = append(serverConfig.StartupHooks, cfg.StartupHooks...)
@@ -476,7 +431,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	serverConfig.ControlConfig.CipherSuites = tlsCipherSuites
 	serverConfig.ControlConfig.TLSCipherSuites, err = kubeapiserverflag.TLSCipherSuites(tlsCipherSuites)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "invalid tls-cipher-suites")
+		return errors.WithMessage(err, "invalid tls-cipher-suites")
 	}
 
 	// If performing a cluster reset, make sure control-plane components are
@@ -530,6 +485,44 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 	notifySocket := os.Getenv("NOTIFY_SOCKET")
 	os.Unsetenv("NOTIFY_SOCKET")
 
+	// try setting advertise-ip from agent VPN
+	if vpnInfo, _ := vpn.GetInfoFromExecutor(); vpnInfo != nil {
+		// If we are in ipv6-only mode, we should pass the ipv6 address. Otherwise, ipv4
+		if utilsnet.IsIPv6(nodeIPs[0]) {
+			if vpnInfo.IPv6Address != nil {
+				logrus.Infof("Changed advertise-address to %v due to VPN", vpnInfo.IPv6Address)
+				if serverConfig.ControlConfig.AdvertiseIP != "" {
+					logrus.Warn("Conflict in the config detected. VPN integration overwrites advertise-address but the config is setting the advertise-address parameter")
+				}
+				serverConfig.ControlConfig.AdvertiseIP = vpnInfo.IPv6Address.String()
+			} else {
+				return errors.New("tailscale does not provide an ipv6 address")
+			}
+		} else {
+			// We are in dual-stack or ipv4-only mode
+			if vpnInfo.IPv4Address != nil {
+				logrus.Infof("Changed advertise-address to %v due to VPN", vpnInfo.IPv4Address)
+				if serverConfig.ControlConfig.AdvertiseIP != "" {
+					logrus.Warn("Conflict in the config detected. VPN integration overwrites advertise-address but the config is setting the advertise-address parameter")
+				}
+				serverConfig.ControlConfig.AdvertiseIP = vpnInfo.IPv4Address.String()
+			} else {
+				return errors.New("tailscale does not provide an ipv4 address")
+			}
+		}
+		logrus.Warn("Etcd IP (PrivateIP) remains the local IP. Running etcd traffic over VPN is not recommended due to performance issues")
+	} else {
+		// if not set, try setting advertise-ip from agent node-external-ip
+		if serverConfig.ControlConfig.AdvertiseIP == "" && len(cmds.AgentConfig.NodeExternalIP.Value()) != 0 {
+			serverConfig.ControlConfig.AdvertiseIP = util.GetFirstValidIPString(cmds.AgentConfig.NodeExternalIP.Value())
+		}
+
+		// if not set, try setting advertise-ip from agent node-ip
+		if serverConfig.ControlConfig.AdvertiseIP == "" && len(cmds.AgentConfig.NodeIP.Value()) != 0 {
+			serverConfig.ControlConfig.AdvertiseIP = util.GetFirstValidIPString(cmds.AgentConfig.NodeIP.Value())
+		}
+	}
+
 	if err := server.PrepareServer(ctx, wg, &serverConfig, cfg); err != nil {
 		return err
 	}
@@ -567,7 +560,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 
 		// initialize the apiAddress Channel for receiving the api address from etcd
 		agentConfig.APIAddressCh = make(chan []string)
-		go getAPIAddressFromEtcd(ctx, serverConfig, agentConfig)
+		go pollAPIAddressFromEtcd(ctx, serverConfig, agentConfig)
 	}
 
 	// Until the agent is run and retrieves config from the server, we won't know
@@ -606,6 +599,13 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		}
 	}
 
+	// if we ended up with any advertise-ips, ensure they're added to the SAN list;
+	// note that kube-apiserver does not support dual-stack advertise-ip as of 1.21.0:
+	// https://github.com/kubernetes/kubeadm/issues/1612#issuecomment-772583989
+	if serverConfig.ControlConfig.AdvertiseIP != "" {
+		serverConfig.ControlConfig.SANs = append(serverConfig.ControlConfig.SANs, serverConfig.ControlConfig.AdvertiseIP)
+	}
+
 	go cmds.WriteCoverage(ctx)
 
 	serverConfig.ControlConfig.Runtime.StartupHooksWg = &sync.WaitGroup{}
@@ -626,11 +626,7 @@ func run(app *cli.Context, cfg *cmds.Server, leaderControllers server.CustomCont
 		systemd.SdNotify(true, "READY=1\n")
 	}()
 
-	if err := server.StartServer(ctx, wg, &serverConfig, cfg); err != nil {
-		return err
-	}
-
-	return nil
+	return server.StartServer(ctx, wg, &serverConfig, cfg)
 }
 
 // validateNetworkConfig ensures that the network configuration values make sense.
@@ -648,23 +644,20 @@ func validateNetworkConfiguration(serverConfig server.Config) error {
 	return nil
 }
 
-func getAPIAddressFromEtcd(ctx context.Context, serverConfig server.Config, agentConfig cmds.Agent) {
+func pollAPIAddressFromEtcd(ctx context.Context, serverConfig server.Config, agentConfig cmds.Agent) {
 	defer close(agentConfig.APIAddressCh)
-	for {
-		toCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	pollDuration := time.Second * 5
+	wait.PollUntilContextCancel(ctx, pollDuration, true, func(ctx context.Context) (bool, error) {
+		ctx, cancel := context.WithTimeout(ctx, pollDuration)
 		defer cancel()
-		serverAddresses, err := etcd.GetAPIServerURLsFromETCD(toCtx, &serverConfig.ControlConfig)
+		serverAddresses, err := etcd.GetAPIServerURLsFromETCD(ctx, &serverConfig.ControlConfig)
 		if err == nil && len(serverAddresses) > 0 {
 			agentConfig.APIAddressCh <- serverAddresses
-			return
+			return true, nil
 		}
 		if !errors.Is(err, etcd.ErrAddressNotSet) {
 			logrus.Warnf("Failed to get apiserver address from etcd: %v", err)
 		}
-		select {
-		case <-toCtx.Done():
-		case <-ctx.Done():
-			return
-		}
-	}
+		return false, nil
+	})
 }

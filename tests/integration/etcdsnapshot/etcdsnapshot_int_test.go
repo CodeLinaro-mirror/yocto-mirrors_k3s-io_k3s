@@ -2,6 +2,7 @@ package snapshot_test
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -146,6 +147,16 @@ var _ = Describe("etcd snapshots", Ordered, func() {
 				return len(matches), err
 			}, "120s", "30s").Should(Equal(etcdSnapshotRetention))
 		})
+		It("writes the compressed snapshot with non-world-readable permissions", func() {
+			matches, err := filepath.Glob(filepath.Join(populatedTestSnapshotDir, fmt.Sprintf("%s%s%s", "*", etcdSnapshotFilePattern, "*.zip")))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(matches).ToNot(BeEmpty())
+			for _, match := range matches {
+				info, err := os.Stat(match)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(info.Mode().Perm()).To(Equal(os.FileMode(0600)))
+			}
+		})
 		It("kills previous server and start up with no problems and disabled snapshots", func() {
 
 			var err error
@@ -183,6 +194,8 @@ var _ = AfterSuite(func() {
 	if !testutil.IsExistingServer() {
 		if failed {
 			testutil.K3sSaveLog(server, false)
+			testutil.K3sCopyPodLogs(server)
+			testutil.K3sDumpResources(server, "node", "pod", "pvc", "pv")
 		}
 		Expect(testutil.K3sKillServer(server)).To(Succeed())
 		Expect(testutil.K3sCleanup(testLock, "")).To(Succeed())

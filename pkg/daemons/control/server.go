@@ -2,14 +2,11 @@ package control
 
 import (
 	"context"
-	"errors"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/k3s-io/k3s/pkg/authenticator"
 	"github.com/k3s-io/k3s/pkg/cluster"
@@ -18,17 +15,16 @@ import (
 	"github.com/k3s-io/k3s/pkg/daemons/executor"
 	"github.com/k3s-io/k3s/pkg/signals"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/errors"
 	"github.com/k3s-io/k3s/pkg/version"
-	pkgerrors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	authorizationv1 "k8s.io/api/authorization/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	k8sruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
-	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/client-go/tools/cache"
+	toolscache "k8s.io/client-go/tools/cache"
 	toolswatch "k8s.io/client-go/tools/watch"
 	cloudproviderapi "k8s.io/cloud-provider/api"
 	logsapi "k8s.io/component-base/logs/api/v1"
@@ -42,16 +38,14 @@ import (
 // Prepare loads bootstrap data from the datastore and sets up the initial
 // tunnel server request handler and stub authenticator.
 func Prepare(ctx context.Context, wg *sync.WaitGroup, cfg *config.Control) error {
-	rand.Seed(time.Now().UTC().UnixNano())
-
 	logsapi.ReapplyHandling = logsapi.ReapplyHandlingIgnoreUnchanged
 	if err := prepare(ctx, wg, cfg); err != nil {
-		return pkgerrors.WithMessage(err, "preparing server")
+		return errors.WithMessage(err, "preparing server")
 	}
 
 	tunnel, err := setupTunnel(ctx, cfg)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "setup tunnel server")
+		return errors.WithMessage(err, "setup tunnel server")
 	}
 	cfg.Runtime.Tunnel = tunnel
 
@@ -74,7 +68,7 @@ func Prepare(ctx context.Context, wg *sync.WaitGroup, cfg *config.Control) error
 // not disabled on this node.
 func Server(ctx context.Context, wg *sync.WaitGroup, cfg *config.Control) error {
 	if err := cfg.Cluster.Start(ctx, wg); err != nil {
-		return pkgerrors.WithMessage(err, "failed to start cluster")
+		return errors.WithMessage(err, "failed to start cluster")
 	}
 
 	// Create a new context to use for control-plane components that is
@@ -198,7 +192,7 @@ func scheduler(ctx context.Context, cfg *config.Control) error {
 			logrus.Infof("Waiting for untainted node")
 			// this waits forever for an untainted node; if it returns ErrWaitTimeout the context has been cancelled, and it is not a fatal error
 			if err := waitForUntaintedNode(ctx, runtime.KubeConfigScheduler); err != nil && !errors.Is(err, wait.ErrWaitTimeout) {
-				signals.RequestShutdown(pkgerrors.WithMessage(err, "failed to wait for untained node"))
+				signals.RequestShutdown(errors.WithMessage(err, "failed to wait for untained node"))
 			}
 		}
 	}()
@@ -315,12 +309,12 @@ func prepare(ctx context.Context, wg *sync.WaitGroup, config *config.Control) er
 		return err
 	}
 
-	if dataDir, err := filepath.Abs(config.DataDir); err != nil {
+	dataDir, err := filepath.Abs(config.DataDir)
+	if err != nil {
 		return err
-	} else {
-		config.DataDir = dataDir
 	}
 
+	config.DataDir = dataDir
 	os.MkdirAll(filepath.Join(config.DataDir, "etc"), 0700)
 	os.MkdirAll(filepath.Join(config.DataDir, "tls"), 0700)
 	os.MkdirAll(filepath.Join(config.DataDir, "cred"), 0700)
@@ -329,15 +323,15 @@ func prepare(ctx context.Context, wg *sync.WaitGroup, config *config.Control) er
 
 	config.Cluster = cluster.New(config)
 	if err := config.Cluster.Bootstrap(ctx, config.ClusterReset); err != nil {
-		return pkgerrors.WithMessage(err, "failed to bootstrap cluster data")
+		return errors.WithMessage(err, "failed to bootstrap cluster data")
 	}
 
 	if err := deps.GenServerDeps(config); err != nil {
-		return pkgerrors.WithMessage(err, "failed to generate server dependencies")
+		return errors.WithMessage(err, "failed to generate server dependencies")
 	}
 
 	if err := config.Cluster.ListenAndServe(ctx); err != nil {
-		return pkgerrors.WithMessage(err, "failed to start supervisor listener")
+		return errors.WithMessage(err, "failed to start supervisor listener")
 	}
 
 	return nil
@@ -406,36 +400,40 @@ func cloudControllerManager(ctx context.Context, cfg *config.Control) error {
 
 		<-executor.APIServerReadyChan()
 
-		logrus.Infof("Waiting for cloud-controller-manager privileges to become available")
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case err := <-promise(func() error { return checkForCloudControllerPrivileges(ctx, cfg.Runtime, 5*time.Second) }):
-				if err != nil {
-					logrus.Infof("Waiting for cloud-controller-manager privileges to become available: %v", err)
-					continue
-				}
-				return
-			}
+		if err := checkForCloudControllerPrivileges(ctx, cfg.Runtime); err != nil {
+			signals.RequestShutdown(errors.WithMessage(err, "failed to wait for cloud-controller-manager RBAC"))
 		}
 	}()
-
 	return executor.CloudControllerManager(ctx, ccmRBACReady, args)
 }
 
 // checkForCloudControllerPrivileges makes a SubjectAccessReview request to the apiserver
 // to validate that the embedded cloud controller manager has the required privileges,
-// and does not return until the requested access is granted.
+// and does not return until the requested access is granted. Both the K3s RBAC, and the
+// core extension-apiserver-authentication-reader RBAC, are checked.
 // If the CCM RBAC changes, the ResourceAttributes checked for by this function should
 // be modified to check for the most recently added privilege.
-func checkForCloudControllerPrivileges(ctx context.Context, runtime *config.ControlRuntime, timeout time.Duration) error {
-	return util.WaitForRBACReady(ctx, runtime.KubeConfigSupervisor, timeout, authorizationv1.ResourceAttributes{
-		Namespace: metav1.NamespaceSystem,
-		Verb:      "watch",
-		Resource:  "endpointslices",
-		Group:     "discovery.k8s.io",
-	}, version.Program+"-cloud-controller-manager")
+func checkForCloudControllerPrivileges(ctx context.Context, runtime *config.ControlRuntime) error {
+	ras := []authorizationv1.ResourceAttributes{
+		{
+			Namespace: metav1.NamespaceSystem,
+			Verb:      "get",
+			Resource:  "configmaps",
+			Name:      "extension-apiserver-authentication",
+		},
+		{
+			Namespace: metav1.NamespaceSystem,
+			Verb:      "watch",
+			Resource:  "endpointslices",
+			Group:     "discovery.k8s.io",
+		},
+	}
+	for _, ra := range ras {
+		if err := util.WaitForRBACReady(ctx, runtime.KubeConfigSupervisor, util.DefaultAPIServerReadyTimeout, ra, version.Program+"-cloud-controller-manager"); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func waitForAPIServerHandlers(ctx context.Context, runtime *config.ControlRuntime) {
@@ -447,36 +445,15 @@ func waitForAPIServerHandlers(ctx context.Context, runtime *config.ControlRuntim
 	runtime.APIServer = handler
 }
 
-func promise(f func() error) <-chan error {
-	c := make(chan error, 1)
-	go func() {
-		c <- f()
-		close(c)
-	}()
-	return c
-}
-
 // waitForUntaintedNode watches nodes, waiting to find one not tainted as
 // uninitialized by the external cloud provider.
 func waitForUntaintedNode(ctx context.Context, kubeConfig string) error {
-	restConfig, err := util.GetRESTConfig(kubeConfig)
+	client, err := util.GetClientSet(kubeConfig)
 	if err != nil {
 		return err
 	}
-	coreClient, err := typedcorev1.NewForConfig(restConfig)
-	if err != nil {
-		return err
-	}
-	nodes := coreClient.Nodes()
 
-	lw := &cache.ListWatch{
-		ListFunc: func(options metav1.ListOptions) (object k8sruntime.Object, e error) {
-			return nodes.List(ctx, options)
-		},
-		WatchFunc: func(options metav1.ListOptions) (i watch.Interface, e error) {
-			return nodes.Watch(ctx, options)
-		},
-	}
+	lw := toolscache.NewListWatchFromClient(client.CoreV1().RESTClient(), "nodes", metav1.NamespaceNone, fields.Everything())
 
 	condition := func(ev watch.Event) (bool, error) {
 		if node, ok := ev.Object.(*v1.Node); ok {
@@ -486,7 +463,7 @@ func waitForUntaintedNode(ctx context.Context, kubeConfig string) error {
 	}
 
 	if _, err := toolswatch.UntilWithSync(ctx, lw, &v1.Node{}, nil, condition); err != nil {
-		return pkgerrors.WithMessage(err, "failed to wait for untainted node")
+		return errors.WithMessage(err, "failed to wait for untainted node")
 	}
 	return nil
 }

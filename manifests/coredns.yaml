@@ -67,12 +67,12 @@ data:
           fallthrough
         }
         prometheus :9153
-        forward . /etc/resolv.conf
         cache 30
         loop
         reload
         loadbalance
         import /etc/coredns/custom/*.override
+        forward . /etc/resolv.conf
     }
     import /etc/coredns/custom/*.server
 ---
@@ -123,7 +123,7 @@ spec:
               k8s-app: kube-dns
       containers:
       - name: coredns
-        image: "%{SYSTEM_DEFAULT_REGISTRY}%rancher/mirrored-coredns-coredns:1.12.3"
+        image: "%{SYSTEM_DEFAULT_REGISTRY}%rancher/mirrored-coredns-coredns:1.14.4"
         imagePullPolicy: IfNotPresent
         resources:
           limits:

@@ -2,7 +2,6 @@
 // - modified from https://github.com/cloudnativelabs/kube-router/blob/73b1b03b32c5755b240f6c077bb097abe3888314/pkg/controllers/netpol.go
 
 //go:build !windows
-// +build !windows
 
 package netpol
 
@@ -27,10 +26,9 @@ import (
 	"github.com/k3s-io/k3s/pkg/daemons/config"
 	"github.com/k3s-io/k3s/pkg/metrics"
 	"github.com/k3s-io/k3s/pkg/util"
-	pkgerrors "github.com/pkg/errors"
+	"github.com/k3s-io/k3s/pkg/util/errors"
 	"github.com/sirupsen/logrus"
 	v1 "k8s.io/api/core/v1"
-	v1core "k8s.io/api/core/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 )
@@ -98,7 +96,7 @@ func Run(ctx context.Context, wg *sync.WaitGroup, nodeConfig *config.Node) error
 		}
 		return true, nil
 	}); err != nil {
-		return pkgerrors.WithMessagef(err, "network policy controller failed to wait for %s taint to be removed from Node %s", cloudproviderapi.TaintExternalCloudProvider, nodeConfig.AgentConfig.NodeName)
+		return errors.WithMessagef(err, "network policy controller failed to wait for %s taint to be removed from Node %s", cloudproviderapi.TaintExternalCloudProvider, nodeConfig.AgentConfig.NodeName)
 	}
 
 	krConfig := options.NewKubeRouterConfig()
@@ -126,35 +124,35 @@ func Run(ctx context.Context, wg *sync.WaitGroup, nodeConfig *config.Node) error
 	informerFactory.Start(stopCh)
 	informerFactory.WaitForCacheSync(stopCh)
 
-	iptablesCmdHandlers := make(map[v1core.IPFamily]utils.IPTablesHandler, 2)
-	ipSetHandlers := make(map[v1core.IPFamily]utils.IPSetHandler, 2)
+	iptablesCmdHandlers := make(map[v1.IPFamily]utils.IPTablesHandler, 2)
+	ipSetHandlers := make(map[v1.IPFamily]utils.IPSetHandler, 2)
 
 	if nodeConfig.AgentConfig.EnableIPv4 {
 		iptHandler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
 		if err != nil {
-			return pkgerrors.WithMessage(err, "failed to create iptables handler")
+			return errors.WithMessage(err, "failed to create iptables handler")
 		}
-		iptablesCmdHandlers[v1core.IPv4Protocol] = iptHandler
+		iptablesCmdHandlers[v1.IPv4Protocol] = iptHandler
 
 		ipset, err := utils.NewIPSet(false)
 		if err != nil {
-			return pkgerrors.WithMessage(err, "failed to create ipset handler")
+			return errors.WithMessage(err, "failed to create ipset handler")
 		}
-		ipSetHandlers[v1core.IPv4Protocol] = ipset
+		ipSetHandlers[v1.IPv4Protocol] = ipset
 	}
 
 	if nodeConfig.AgentConfig.EnableIPv6 {
 		ipt6Handler, err := iptables.NewWithProtocol(iptables.ProtocolIPv6)
 		if err != nil {
-			return pkgerrors.WithMessage(err, "failed to create iptables handler")
+			return errors.WithMessage(err, "failed to create iptables handler")
 		}
-		iptablesCmdHandlers[v1core.IPv6Protocol] = ipt6Handler
+		iptablesCmdHandlers[v1.IPv6Protocol] = ipt6Handler
 
 		ipset, err := utils.NewIPSet(true)
 		if err != nil {
-			return pkgerrors.WithMessage(err, "failed to create ipset handler")
+			return errors.WithMessage(err, "failed to create ipset handler")
 		}
-		ipSetHandlers[v1core.IPv6Protocol] = ipset
+		ipSetHandlers[v1.IPv6Protocol] = ipset
 	}
 
 	// Start kube-router healthcheck controller; netpol requires it
@@ -181,7 +179,7 @@ func Run(ctx context.Context, wg *sync.WaitGroup, nodeConfig *config.Node) error
 	npc, err := netpol.NewNetworkPolicyController(client, krConfig, podInformer, npInformer, nsInformer, &sync.Mutex{}, nil,
 		iptablesCmdHandlers, ipSetHandlers)
 	if err != nil {
-		return pkgerrors.WithMessage(err, "unable to initialize network policy controller")
+		return errors.WithMessage(err, "unable to initialize network policy controller")
 	}
 
 	podInformer.AddEventHandler(npc.PodEventHandler)

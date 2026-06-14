@@ -38,7 +38,7 @@ kubelet-arg:
   - 'event-qps=0'
   - "tls-cipher-suites=TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305"
 kube-apiserver-arg:
-  - 'admission-control-config-file=/tmp/cluster-level-pss.yaml'
+  - 'admission-control-config-file=/home/cluster-level-pss.yaml'
   - 'audit-log-path=/var/lib/rancher/k3s/server/logs/audit.log'
   - 'audit-policy-file=/var/lib/rancher/k3s/server/audit.yaml'
   - 'audit-log-maxage=30'
@@ -54,8 +54,8 @@ kubelet-arg:
 			Expect(config.ProvisionServers(1)).To(Succeed())
 
 			for _, server := range config.Servers {
-				cmd := "docker cp ./cluster-level-pss.yaml " + server.Name + ":/tmp/cluster-level-pss.yaml"
-				Expect(docker.RunCommand(cmd)).Error().NotTo(HaveOccurred())
+				cmd := "docker cp ./cluster-level-pss.yaml " + server.Name + ":/home/cluster-level-pss.yaml"
+				Expect(tests.RunCommand(cmd)).Error().NotTo(HaveOccurred())
 
 				cmd = "mkdir -p /var/lib/rancher/k3s/server/logs"
 				Expect(server.RunCmdOnNode(cmd)).Error().NotTo(HaveOccurred())
@@ -80,10 +80,9 @@ kubelet-arg:
 		It("applies network policies", func() {
 			_, err := config.DeployWorkload("hardened-ingress.yaml")
 			Expect(err).NotTo(HaveOccurred())
-			Eventually(func() (string, error) {
-				cmd := "kubectl get daemonset -n default example -o jsonpath='{.status.numberReady}' --kubeconfig=" + config.KubeconfigFile
-				return docker.RunCommand(cmd)
-			}, "60s", "5s").Should(Equal("2"))
+			Eventually(func() (int, error) {
+				return tests.GetDaemonsetReady("example", config.KubeconfigFile)
+			}, "60s", "5s").Should(Equal(2))
 			_, err = config.DeployWorkload("hardened-netpool.yaml")
 			Expect(err).NotTo(HaveOccurred())
 		})
@@ -91,24 +90,24 @@ kubelet-arg:
 			for _, scheme := range []string{"http", "https"} {
 				Eventually(func(g Gomega) {
 					for _, server := range config.Servers {
-						cmd := fmt.Sprintf("curl -vksf -H 'Host: example.com' %s://%s/", scheme, server.IP)
-						g.Expect(docker.RunCommand(cmd)).Error().NotTo(HaveOccurred())
+						cmd := fmt.Sprintf("curl -vksf -m 5 -H 'Host: example.com' %s://%s/", scheme, server.IP)
+						g.Expect(tests.RunCommand(cmd)).Error().NotTo(HaveOccurred())
 					}
 					for _, agent := range config.Agents {
-						cmd := fmt.Sprintf("curl -vksf -H 'Host: example.com' %s://%s/", scheme, agent.IP)
-						g.Expect(docker.RunCommand(cmd)).Error().NotTo(HaveOccurred())
+						cmd := fmt.Sprintf("curl -vksf -m 5 -H 'Host: example.com' %s://%s/", scheme, agent.IP)
+						g.Expect(tests.RunCommand(cmd)).Error().NotTo(HaveOccurred())
 					}
 				}, "30s", "10s").Should(Succeed())
 			}
 		})
 		It("confirms we can make a request through the nodeport service", func() {
 			for _, server := range config.Servers {
-				cmd := "kubectl get service/example -o 'jsonpath={.spec.ports[*].nodePort}' --kubeconfig=" + config.KubeconfigFile
-				ports, err := docker.RunCommand(cmd)
+				cmd := "kubectl get service/example -o 'jsonpath={.spec.ports[*].nodePort}'"
+				ports, err := tests.RunCommand(cmd)
 				Expect(err).NotTo(HaveOccurred())
 				for _, port := range strings.Split(ports, " ") {
-					cmd := fmt.Sprintf("curl -vksf -H 'Host: example.com' http://%s:%s", server.IP, port)
-					Expect(docker.RunCommand(cmd)).Error().NotTo(HaveOccurred())
+					cmd := fmt.Sprintf("curl -vksf -m 5 -H 'Host: example.com' http://%s:%s", server.IP, port)
+					Expect(tests.RunCommand(cmd)).Error().NotTo(HaveOccurred())
 				}
 			}
 		})

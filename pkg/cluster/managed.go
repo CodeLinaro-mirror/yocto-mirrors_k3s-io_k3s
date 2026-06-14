@@ -13,11 +13,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/gorilla/mux"
 	"github.com/k3s-io/k3s/pkg/cluster/managed"
 	"github.com/k3s-io/k3s/pkg/etcd"
 	"github.com/k3s-io/k3s/pkg/nodepassword"
 	"github.com/k3s-io/k3s/pkg/util"
+	"github.com/k3s-io/k3s/pkg/util/mux"
 	"github.com/k3s-io/k3s/pkg/version"
 	"github.com/sirupsen/logrus"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -133,8 +133,7 @@ func (c *Cluster) setupEtcdProxy(ctx context.Context, etcdProxy etcd.Proxy) {
 // deleteNodePasswdSecret wipes out the node password secret after restoration
 func (c *Cluster) deleteNodePasswdSecret(ctx context.Context) {
 	nodeName := os.Getenv("NODE_NAME")
-	secretsClient := c.config.Runtime.Core.Core().V1().Secret()
-	if err := nodepassword.Delete(secretsClient, nodeName); err != nil {
+	if err := nodepassword.Delete(nodeName); err != nil {
 		if apierrors.IsNotFound(err) {
 			logrus.Debugf("Node password secret is not found for node %s", nodeName)
 			return
@@ -145,10 +144,10 @@ func (c *Cluster) deleteNodePasswdSecret(ctx context.Context) {
 
 // handlerNoEtcd wraps a handler with an error message indicating that etcd is not deployed.
 func handlerNoEtcd(handler http.Handler) http.Handler {
-	r := mux.NewRouter().SkipClean(true)
+	r := mux.NewRouter()
 
 	// Wildcard route for anything after /db/
-	r.HandleFunc("/db/{_:.*}", func(resp http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/db/", func(resp http.ResponseWriter, r *http.Request) {
 		util.SendError(errors.New("etcd datastore disabled"), resp, r, http.StatusBadRequest)
 	})
 

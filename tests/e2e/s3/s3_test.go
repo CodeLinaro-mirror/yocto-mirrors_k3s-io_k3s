@@ -16,13 +16,13 @@ import (
 
 // Valid nodeOS:
 // bento/ubuntu-24.04, opensuse/Leap-15.6.x86_64
-// eurolinux-vagrant/rocky-8, eurolinux-vagrant/rocky-9,
+// bento/rockylinux-8, bento/rockylinux-9,
 var nodeOS = flag.String("nodeOS", "bento/ubuntu-24.04", "VM operating system")
 var ci = flag.Bool("ci", false, "running on CI")
 var local = flag.Bool("local", false, "deploy a locally built K3s binary")
 
 // Environment Variables Info:
-// E2E_RELEASE_VERSION=v1.23.1+k3s2 (default: latest commit from master)
+// E2E_RELEASE_VERSION=v1.23.1+k3s2 (default: latest commit from main)
 // E2E_REGISTRY: true/false (default: false)
 
 func Test_E2ES3(t *testing.T) {

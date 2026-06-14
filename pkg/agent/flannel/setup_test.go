@@ -35,7 +35,6 @@ func Test_findNetMode(t *testing.T) {
 		{"wrong input", "wrong", false, false, true},
 	}
 	for _, tt := range tests {
-
 		t.Run(tt.name, func(t *testing.T) {
 			netCidrs := stringToCIDR(tt.args)
 			got, err := findNetMode(netCidrs)
@@ -62,12 +61,17 @@ func Test_createFlannelConf(t *testing.T) {
 		{"dual-stack", "10.42.0.0/16,2001:cafe:22::/56", []string{"\"Network\": \"10.42.0.0/16\"", "\"IPv6Network\": \"2001:cafe:22::/56\"", "\"EnableIPv6\": true"}, false},
 		{"ipv4 only", "10.42.0.0/16", []string{"\"Network\": \"10.42.0.0/16\"", "\"IPv6Network\": \"::/0\"", "\"EnableIPv6\": false"}, false},
 	}
-	var containerd = config.Containerd{}
 	for _, tt := range tests {
-		var agent = config.Agent{}
-		agent.ClusterCIDR = stringToCIDR(tt.args)[0]
-		agent.ClusterCIDRs = stringToCIDR(tt.args)
-		var nodeConfig = &config.Node{Docker: false, ContainerRuntimeEndpoint: "", SELinux: false, FlannelBackend: "vxlan", FlannelConfFile: "test_file", FlannelConfOverride: false, FlannelIface: nil, Containerd: containerd, Images: "", AgentConfig: agent, Token: "", ServerHTTPSPort: 0}
+		var nodeConfig = &config.Node{
+			Flannel: config.Flannel{
+				Backend:  "vxlan",
+				ConfFile: "test_file",
+			},
+			AgentConfig: config.Agent{
+				ClusterCIDR:  stringToCIDR(tt.args)[0],
+				ClusterCIDRs: stringToCIDR(tt.args),
+			},
+		}
 
 		t.Run(tt.name, func(t *testing.T) {
 			if err := createFlannelConf(nodeConfig); (err != nil) != tt.wantErr {
@@ -75,7 +79,7 @@ func Test_createFlannelConf(t *testing.T) {
 			}
 			data, err := os.ReadFile("test_file")
 			if err != nil {
-				t.Errorf("Something went wrong when reading the flannel config file")
+				t.Error("Something went wrong when reading the flannel config file")
 			}
 			for _, config := range tt.wantConfig {
 				isExist, _ := regexp.Match(config, data)

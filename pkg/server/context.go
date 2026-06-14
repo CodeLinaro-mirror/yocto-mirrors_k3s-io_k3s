@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	k3scrds "github.com/k3s-io/api/pkg/crds"
@@ -81,7 +82,7 @@ func NewContext(ctx context.Context, config *Config) (*Context, error) {
 		Discovery: discovery.NewFactoryFromConfigOrDie(restConfig),
 		Helm:      hf,
 
-		Event: util.BuildControllerEventRecorder(k8s, version.Program+"-supervisor", metav1.NamespaceAll),
+		Event: util.BuildControllerEventRecorder(ctx, k8s, version.Program+"-supervisor", metav1.NamespaceAll),
 		K8s:   k8s,
 		Ext:   ext,
 	}
@@ -105,7 +106,7 @@ func (c *Context) registerCRDs(ctx context.Context) error {
 	for _, list := range listers {
 		l, err := list()
 		if err != nil {
-			return err
+			return fmt.Errorf("failed to get CRDs from %s: %v", util.GetFunctionName(list), err)
 		}
 		crds = append(crds, l...)
 	}

@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package etcd
 
@@ -214,6 +213,7 @@ func Test_UnitETCD_Register(t *testing.T) {
 				testutil.CleanupDataDir(cnf)
 				return nil
 			},
+			wantErr: true,
 		},
 	}
 	for _, tt := range tests {
@@ -660,7 +660,7 @@ func Test_UnitETCD_Test(t *testing.T) {
 				return
 			}
 			start := time.Now()
-			err := e.Test(tt.fields.context.ctx)
+			err := e.Test(tt.fields.context.ctx, true)
 			duration := time.Now().Sub(start)
 			t.Logf("ETCD.Test() %q completed in %v with err=%v", tt.name, duration, err)
 			if (err != nil) != tt.wantErr {

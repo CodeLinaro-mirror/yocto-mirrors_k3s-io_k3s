@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,11 +20,15 @@ import (
 
 var (
 	executor Executor
+
+	ErrNotInitialized = errors.New("executor not initialized")
 )
 
-// TestFunc is the signature of a function that returns nil error when the component is ready
-type TestFunc func(context.Context) error
+// TestFunc is the signature of a function that returns nil error when the component is ready.
+// The enableMaintenance flag enables attempts to perform corrective maintenance during the test process.
+type TestFunc func(ctx context.Context, enableMaintenance bool) error
 
+// Executor is a set of functions for bootstrapping a node and starting the CRI, CNI, and Kubernetes components
 type Executor interface {
 	Bootstrap(ctx context.Context, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error
 	Kubelet(ctx context.Context, args []string) error
@@ -38,6 +43,7 @@ type Executor interface {
 	Containerd(ctx context.Context, node *daemonconfig.Node) error
 	Docker(ctx context.Context, node *daemonconfig.Node) error
 	CRI(ctx context.Context, node *daemonconfig.Node) error
+	CNI(ctx context.Context, wg *sync.WaitGroup, node *daemonconfig.Node) error
 	APIServerReadyChan() <-chan struct{}
 	ETCDReadyChan() <-chan struct{}
 	CRIReadyChan() <-chan struct{}
@@ -49,6 +55,7 @@ type ETCDSocketOpts struct {
 	ReusePort    bool `json:"reuse-port,omitempty"`
 }
 
+//revive:disable:struct-tag
 type ETCDConfig struct {
 	InitialOptions       `json:",inline"`
 	Name                 string         `json:"name,omitempty"`
@@ -100,7 +107,7 @@ func (e ETCDConfig) ToConfigFile(extraArgs []string) (string, error) {
 	}
 
 	if len(extraArgs) > 0 {
-		var s map[string]interface{}
+		var s map[string]any
 		if err := yaml2.Unmarshal(bytes, &s); err != nil {
 			return "", err
 		}
@@ -149,71 +156,130 @@ func Set(driver Executor) {
 	executor = driver
 }
 
+func Get() Executor {
+	return executor
+}
+
 func Bootstrap(ctx context.Context, nodeConfig *daemonconfig.Node, cfg cmds.Agent) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.Bootstrap(ctx, nodeConfig, cfg)
 }
 
 func Kubelet(ctx context.Context, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.Kubelet(ctx, args)
 }
 
 func KubeProxy(ctx context.Context, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.KubeProxy(ctx, args)
 }
 
 func APIServerHandlers(ctx context.Context) (authenticator.Request, http.Handler, error) {
+	if executor == nil {
+		return nil, nil, ErrNotInitialized
+	}
 	return executor.APIServerHandlers(ctx)
 }
 
 func APIServer(ctx context.Context, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.APIServer(ctx, args)
 }
 
 func Scheduler(ctx context.Context, nodeReady <-chan struct{}, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.Scheduler(ctx, nodeReady, args)
 }
 
 func ControllerManager(ctx context.Context, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.ControllerManager(ctx, args)
 }
 
 func CurrentETCDOptions() (InitialOptions, error) {
+	if executor == nil {
+		return InitialOptions{}, ErrNotInitialized
+	}
 	return executor.CurrentETCDOptions()
 }
 
 func ETCD(ctx context.Context, wg *sync.WaitGroup, args *ETCDConfig, extraArgs []string, test TestFunc) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.ETCD(ctx, wg, args, extraArgs, test)
 }
 
 func CloudControllerManager(ctx context.Context, ccmRBACReady <-chan struct{}, args []string) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.CloudControllerManager(ctx, ccmRBACReady, args)
 }
 
 func Containerd(ctx context.Context, config *daemonconfig.Node) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.Containerd(ctx, config)
 }
 
 func Docker(ctx context.Context, config *daemonconfig.Node) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.Docker(ctx, config)
 }
 
 func CRI(ctx context.Context, config *daemonconfig.Node) error {
+	if executor == nil {
+		return ErrNotInitialized
+	}
 	return executor.CRI(ctx, config)
 }
 
+func CNI(ctx context.Context, wg *sync.WaitGroup, config *daemonconfig.Node) error {
+	return executor.CNI(ctx, wg, config)
+}
+
 func APIServerReadyChan() <-chan struct{} {
+	if executor == nil {
+		return nil
+	}
 	return executor.APIServerReadyChan()
 }
 
 func ETCDReadyChan() <-chan struct{} {
+	if executor == nil {
+		return nil
+	}
 	return executor.ETCDReadyChan()
 }
 
 func CRIReadyChan() <-chan struct{} {
+	if executor == nil {
+		return nil
+	}
 	return executor.CRIReadyChan()
 }
 
 func IsSelfHosted() bool {
+	if executor == nil {
+		return false
+	}
 	return executor.IsSelfHosted()
 }
 

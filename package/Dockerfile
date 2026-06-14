@@ -1,4 +1,4 @@
-FROM alpine:3.22 AS base
+FROM alpine:3.24 AS base
 RUN apk add -U ca-certificates zstd tzdata
 ARG TARGETARCH
 COPY build/out/data-linux*.tar.zst /
@@ -16,12 +16,12 @@ RUN SOURCE_TAR_ZST="/data-linux-${TARGETARCH}.tar.zst" && \
     cp /etc/ssl/certs/ca-certificates.crt /image/etc/ssl/certs/ca-certificates.crt
 
 FROM scratch AS collect
-ARG DRONE_TAG="dev"
+ARG TAG="dev"
 COPY --from=base /image /
 COPY --from=base /usr/share/zoneinfo /usr/share/zoneinfo
 RUN mkdir -p /etc && \
     echo 'hosts: files dns' > /etc/nsswitch.conf && \
-    echo "PRETTY_NAME=\"K3s ${DRONE_TAG}\"" > /etc/os-release && \
+    echo "PRETTY_NAME=\"K3s ${TAG}\"" > /etc/os-release && \
     chmod 1777 /tmp
 
 FROM scratch
